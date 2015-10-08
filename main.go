@@ -11,12 +11,14 @@ import (
 	"github.com/aws/aws-sdk-go/service/ec2"
 )
 
-var InstanceID = flag.String("i", "", "the instance id whose volumes to tag")
+var InstanceID = flag.String("i", "", "The instance id whose volumes to tag")
+var DryRun = flag.Bool("d", false, "Perform a dry run. Don't make any changes")
+var Region = flag.String("r", "us-east-1", "The AWS region to use")
 var AWSConfig *aws.Config
 
 func init() {
 	AWSConfig = &aws.Config{
-		Region: aws.String("us-east-1"),
+		Region: aws.String(*Region),
 	}
 }
 
@@ -30,67 +32,106 @@ func ValidateID(i *string) (bool, error) {
 	return m, nil
 }
 
-func instanceName(c *ec2.EC2, i *string) (*string, error) {
-	q := &ec2.DescribeTagsInput{
-		Filters: []*ec2.Filter{
-			{
-				Name: aws.String("key"),
-				Values: []*string{
-					aws.String("Name"),
-				},
-			},
-			{
-				Name:   aws.String("resource-id"),
-				Values: []*string{i},
-			},
-		},
+// DescribeInstance gets an Instance object from AWS and returns it, stripping
+// out Reservation data.
+func DescribeInstance(c *ec2.EC2, i *string) (*ec2.Instance, error) {
+	q := &ec2.DescribeInstancesInput{
+		InstanceIds: []*string{i},
 	}
 
-	resp, err := c.DescribeTags(q)
+	resp, err := c.DescribeInstances(q)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(resp.Tags) != 1 {
-		return nil, errors.New("Found more than one name tag.")
+	if len(resp.Reservations[0].Instances) != 1 {
+		return nil, errors.New("Found more than one instance. Bailing")
 	}
 
-	return resp.Tags[0].Value, nil
+	return resp.Reservations[0].Instances[0], nil
 }
 
-func volumesForInstance(c *ec2.EC2, i *string) ([]*string, error) {
-	// blah!
+// NameTag returns the Name tag for an instance
+func NameTag(i *ec2.Instance) (*string, error) {
+	var n *string
 
-	return nil, nil
+	for _, t := range i.Tags {
+		if *t.Key == "Name" {
+			n = t.Value
+			return n, nil
+		}
+	}
+
+	// We didn't find a name tag
+	return nil, errors.New("Could not find Name tag")
+}
+
+// TagVolumesForInstance tags the volumes attached to a given instance with a
+// specified string and the device name
+func TagVolumesForInstance(c *ec2.EC2, i *ec2.Instance, n *string) error {
+	for _, m := range i.BlockDeviceMappings {
+		dn := m.DeviceName
+		e := m.Ebs.VolumeId
+		fmt.Printf("Tag volume %s:  %s - %s\n", *e, *n, *dn)
+
+		p := &ec2.CreateTagsInput{
+			Resources: []*string{
+				aws.String(*e),
+			},
+			Tags: []*ec2.Tag{
+				{
+					Key:   aws.String("Name"),
+					Value: aws.String(fmt.Sprintf("%s - %s", *n, *dn)),
+				},
+			},
+			DryRun: aws.Bool(*DryRun),
+		}
+
+		resp, err := c.CreateTags(p)
+		if err != nil {
+			// Don't return because apparently when `DryRun` is set to true,
+			// the API object also comes with an error.
+			fmt.Println(err)
+		}
+		fmt.Println(resp)
+	}
+
+	return nil
 }
 
 func main() {
 	flag.Parse()
 
-	valid, err := ValidateID(InstanceID)
+	ok, err := ValidateID(InstanceID)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 
-	if valid == false {
-		fmt.Println("Instance ID doesn't appear to be valid")
+	if !ok {
+		fmt.Println("InstanceID doesn't appear to be valid")
 		os.Exit(1)
 	}
 
 	conn := ec2.New(AWSConfig)
 
-	name, err := instanceName(conn, InstanceID)
+	instance, err := DescribeInstance(conn, InstanceID)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	fmt.Printf("Found name for instance %s: %s\n", *InstanceID, *name)
 
-	vols, err := volumesForInstance(conn, InstanceID)
+	name, err := NameTag(instance)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
+	}
 
+	fmt.Printf("Found Name tag: %s\n", *name)
+
+	err = TagVolumesForInstance(conn, instance, name)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
 	}
 }
